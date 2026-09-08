@@ -33,14 +33,14 @@ class FatArch:
         
 class FatHeader:
     def __init__(self, mach_o_file):        
-        __FAT_MAGIC = '\xca\xfe\xba\xbe'
-        __FAT_CIGAM = '\xbe\xba\xfe\xca'
+        __FAT_MAGIC = b'\xca\xfe\xba\xbe'
+        __FAT_CIGAM = b'\xbe\xba\xfe\xca'
 
         #Assuming Fat Header always resides at the beginning of the file
         mach_o_file.seek(0)
-        
+
         magic = mach_o_file.read(4)
-        
+
         if magic == __FAT_MAGIC:
             big_endian = True
         elif magic == __FAT_CIGAM:
