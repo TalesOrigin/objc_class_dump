@@ -45,10 +45,19 @@ class MachOAnalyzer:
             self.__is_64bit_cpu = False
 
         self.__segments = self.__build_segments()
+        if len(self.__segments) == 0:
+            print('Warning: no segment found, the Mach-O file cannot be analyzed')
 
         self.__dylibs = self.__build_load_dylib()
 
+        self.__chained_fixups = None
+        self.__chained_fixups_data = b''
+
         dyld_info = self.get_dyld_info()
+
+        #Modern binaries (iOS 13.4+/macOS 10.15+ toolchains) may carry their binding
+        #information in LC_DYLD_CHAINED_FIXUPS instead of LC_DYLD_INFO(_ONLY).
+        self.__chained_fixups = self.__parse_chained_fixups()
 
         #pass1: build the import table
         if dyld_info.bind_size != 0:
@@ -62,6 +71,10 @@ class MachOAnalyzer:
         if dyld_info.lazy_bind_size != 0:
             #print 'lazy bind pass1'
             self.__build_bind_info(dyld_info.lazy_bind_off, dyld_info.lazy_bind_size, self.__bind_pass1)
+
+        if self.__chained_fixups != None:
+            #print 'chained fixups pass1'
+            self.__build_chained_fixups_info(self.__chained_fixups_bind_pass1)
 
         #build virtual section from the import table
         #TODO revise the data structure for addend
@@ -79,6 +92,10 @@ class MachOAnalyzer:
         if dyld_info.lazy_bind_size != 0:
             #print 'lazy bind pass2'
             self.__build_bind_info(dyld_info.lazy_bind_off, dyld_info.lazy_bind_size, self.__bind_pass2)
+
+        if self.__chained_fixups != None:
+            #print 'chained fixups pass2'
+            self.__build_chained_fixups_info(self.__chained_fixups_bind_pass2)
 
         self.__objc2_cls_stack = []
         self.__resloved_objc2_cls_list = []
@@ -154,9 +171,17 @@ class MachOAnalyzer:
         self.__fd.seek(self.__mh_offset + self.__mach_header.get_hdr_len())
 
         segments = []
+        cmds_end = self.__mh_offset + self.__mach_header.get_hdr_len() + self.__mach_header.get_sizeof_cmds()
         for i in range(n_lcmds):
+            if self.__fd.tell() + 8 > cmds_end:
+                print('Warning: load command {:d} is outside of the load command region, stop walking'.format(i))
+                break
             type, len = struct.unpack(self.__endian_str + 'LL', self.__fd.read(8))
-            if self.__is_64bit_cpu == True and MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.SEGMENT_64:
+            cmd_type = load_command_type(type)
+            if len < 8:
+                print('Warning: invalid load command size ({:d}) at load command {:d}, stop walking'.format(len, i))
+                break
+            if self.__is_64bit_cpu == True and cmd_type == MACH_O_LOAD_COMMAND_TYPE.SEGMENT_64:
                 name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags = \
                     struct.unpack(self.__endian_str + '16sQQQQLLLL', self.__fd.read(64))
                 name = bytes_to_str(name.strip(b'\x00'))
@@ -170,7 +195,7 @@ class MachOAnalyzer:
                     section = Section(sec_name, vmaddr, vmsize, offset, alignment, reloff, nreloc, flags, reserved1, reserved2, reserved3)
                     segment.append_section(section)
                     
-            elif self.__is_64bit_cpu == False and MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.SEGMENT:
+            elif self.__is_64bit_cpu == False and cmd_type == MACH_O_LOAD_COMMAND_TYPE.SEGMENT:
                 name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags = \
                     struct.unpack(self.__endian_str + '16sLLLLLLLL', self.__fd.read(48))
                 name = bytes_to_str(name.strip(b'\x00'))
@@ -214,12 +239,27 @@ class MachOAnalyzer:
 
         dylibs = []
         dylib_cmd_count = 0
+        cmds_end = self.__mh_offset + offset + self.__mach_header.get_sizeof_cmds()
         for i in range(n_cmds):
+            if self.__mh_offset + offset + dylib_cmd_count + 8 > cmds_end:
+                print('Warning: load command {:d} is outside of the load command region, stop walking'.format(i))
+                break
             type, lc_len = struct.unpack(self.__endian_str + 'LL', self.__fd.read(8))
-            if (MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.LOAD_DYLIB) or \
-                (MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.WEAK_DYLIB):
+            if lc_len < 8:
+                print('Warning: invalid load command size ({:d}) at load command {:d}, stop walking'.format(lc_len, i))
+                break
+            cmd_type = load_command_type(type)
+            if cmd_type == MACH_O_LOAD_COMMAND_TYPE.LOAD_DYLIB or \
+                cmd_type == MACH_O_LOAD_COMMAND_TYPE.WEAK_DYLIB or \
+                cmd_type == MACH_O_LOAD_COMMAND_TYPE.REEXPORT_DYLIB or \
+                cmd_type == MACH_O_LOAD_COMMAND_TYPE.LAZY_LOAD_DYLIB or \
+                cmd_type == MACH_O_LOAD_COMMAND_TYPE.LOAD_UPWARD_DYLIB or \
+                cmd_type == MACH_O_LOAD_COMMAND_TYPE.ID_DYLIB:
                 off, ts, cur_ver, compat_ver = struct.unpack(self.__endian_str + 'LLLL', self.__fd.read(16))
 
+                #the install name does not have to directly follow the dylib_command header,
+                #it is located at name_off bytes from the beginning of the load command
+                self.__fd.seek(self.__mh_offset + offset + dylib_cmd_count + off)
                 c_str = b''
                 while True:
                     c = self.__fd.read(1)
@@ -227,17 +267,30 @@ class MachOAnalyzer:
                         break
                     c_str = c_str + c
 
-                self.__fd.seek(lc_len - 8 - 16 - len(c_str) - 1, os.SEEK_CUR)
-                
                 dylib = DYLib(ts, cur_ver, compat_ver, bytes_to_str(c_str))
                 dylibs.append(dylib)
+                dylib_cmd_count += lc_len
             else:
-                self.__fd.seek(lc_len - 8, os.SEEK_CUR)
+                dylib_cmd_count += lc_len
+
+            self.__fd.seek(self.__mh_offset + offset + dylib_cmd_count)
         return dylibs
 
     def get_dylib(self, lib_idx):
+        if lib_idx < 0 or lib_idx >= len(self.__dylibs):
+            return None
         return self.__dylibs[lib_idx]
-        pass
+
+    #Library ordinal of a dyld_info bind opcode, 1 based index into the dylib list
+    def get_dylib_by_ordinal(self, lib_ordinal):
+        return self.get_dylib(lib_ordinal - 1)
+
+    #Library ordinal of a chained fixup bind entry. Chained fixups use special
+    #negative/zero ordinals which do not refer to an entry of the dylib list.
+    def get_chained_dylib_by_ordinal(self, lib_ordinal):
+        if lib_ordinal > 0:
+            return self.get_dylib(lib_ordinal - 1)
+        return None
 
     '''
     struct dyld_info
@@ -272,10 +325,18 @@ class MachOAnalyzer:
         lazy_bind_size = 0
         export_off = 0
         export_size = 0
+        cmds_end = self.__mh_offset + offset + self.__mach_header.get_sizeof_cmds()
         for i in range(n_cmds):
+            if self.__fd.tell() + 8 > cmds_end:
+                break
             type, len = struct.unpack(self.__endian_str + 'LL', self.__fd.read(8))
+            if len < 8:
+                break
+            cmd_type = load_command_type(type)
 
-            if MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.DYLD_INFO:
+            #LC_DYLD_INFO (0x22) and LC_DYLD_INFO_ONLY (0x80000022) share the same struct
+            #and the same enum member, DYLD_INFO_ONLY being an alias of DYLD_INFO
+            if cmd_type == MACH_O_LOAD_COMMAND_TYPE.DYLD_INFO:
                 rebase_off, rebase_size, bind_off, bind_size, weak_bind_off, weak_bind_size, lazy_bind_off, lazy_bind_size, export_off, export_size \
                     = struct.unpack(self.__endian_str + 'LLLLLLLLLL', self.__fd.read(40))
                 break
@@ -284,6 +345,385 @@ class MachOAnalyzer:
         
         dyld_info = DYLDInfo(rebase_off, rebase_size, bind_off, bind_size, weak_bind_off, weak_bind_size, lazy_bind_off, lazy_bind_size, export_off, export_size)
         return dyld_info
+
+    '''
+    struct linkedit_data_command
+    {
+        unsigned long cmd;        //LC_DYLD_CHAINED_FIXUPS or LC_DYLD_EXPORTS_TRIE
+        unsigned long cmdsize;    // sizeof(struct linkedit_data_command)
+        unsigned long dataoff;    // file offset of data in __LINKEDIT segment
+        unsigned long datasize;   // file size of data in __LINKEDIT segment
+    }
+    '''
+    #Search for LC_DYLD_CHAINED_FIXUPS and return the location of its payload
+    def get_chained_fixups_cmd(self):
+        offset = self.__mach_header.get_hdr_len()
+        n_cmds = self.__mach_header.get_number_cmds()
+        self.__fd.seek(self.__mh_offset + offset)
+
+        cmds_end = self.__mh_offset + offset + self.__mach_header.get_sizeof_cmds()
+        for i in range(n_cmds):
+            if self.__fd.tell() + 8 > cmds_end:
+                break
+            type, len = struct.unpack(self.__endian_str + 'LL', self.__fd.read(8))
+            if len < 8:
+                break
+            cmd_type = load_command_type(type)
+
+            if cmd_type == MACH_O_LOAD_COMMAND_TYPE.DYLD_CHAINED_FIXUPS:
+                dataoff, datasize = struct.unpack(self.__endian_str + 'LL', self.__fd.read(8))
+                return DYLD_CHAINED_FIXUPS(dataoff, datasize)
+
+            self.__fd.seek(len - 8, os.SEEK_CUR)
+        return None
+
+    '''
+    struct dyld_chained_fixups_header
+    {
+        uint32_t    fixups_version;     // 0
+        uint32_t    starts_offset;      // offset of dyld_chained_starts_in_image in chain_data
+        uint32_t    imports_offset;     // offset of imports table in chain_data
+        uint32_t    symbols_offset;     // offset of symbol strings in chain_data
+        uint32_t    imports_count;      // number of imported symbol names
+        uint32_t    imports_format;     // DYLD_CHAINED_IMPORT*
+        uint32_t    symbols_format;     // 0 => uncompressed, 1 => zlib compressed
+    }
+    '''
+    #Parse the LC_DYLD_CHAINED_FIXUPS payload: the header, the import table and the
+    #per segment chain starts. Returns None if the binary does not use chained fixups.
+    def __parse_chained_fixups(self):
+        cmd = self.get_chained_fixups_cmd()
+        if cmd == None:
+            return None
+
+        self.__fd.seek(self.__mh_offset + cmd.dataoff)
+        chain_data = self.__fd.read(cmd.datasize)
+        if len(chain_data) < 32:
+            print('Warning: truncated LC_DYLD_CHAINED_FIXUPS payload, chained fixups ignored')
+            return None
+
+        fixups_version, starts_offset, imports_offset, symbols_offset, imports_count, imports_format, symbols_format = \
+            struct.unpack('<LLLLLLL', chain_data[0:28])
+
+        cmd.fixups_version = fixups_version
+        cmd.starts_offset = starts_offset
+        cmd.imports_offset = imports_offset
+        cmd.symbols_offset = symbols_offset
+        cmd.imports_count = imports_count
+        cmd.symbols_format = symbols_format
+
+        if symbols_format != 0:
+            #zlib compressed symbol strings are not produced by the default toolchain
+            print('Warning: compressed chained fixups symbol strings (format {:d}) are not supported'.format(symbols_format))
+
+        try:
+            cmd.imports_format = DYLD_CHAINED_IMPORT_FORMAT(imports_format)
+        except ValueError:
+            print('Warning: unknown chained fixups imports format 0x{:X}, import table ignored'.format(imports_format))
+            cmd.imports_format = None
+
+        #The chained fixups structures are defined little endian only
+        self.__chained_fixups_data = chain_data
+        cmd.imports = self.__parse_chained_fixups_imports(cmd, chain_data)
+        starts_in_segments = self.__parse_chained_starts_in_image(chain_data, starts_offset)
+
+        return ChainedFixups(cmd, starts_in_segments)
+
+    #Decode the import table of a chained fixups payload
+    def __parse_chained_fixups_imports(self, cmd, chain_data):
+        imports = []
+        if cmd.imports_format == None:
+            return imports
+
+        entry_fmt, entry_size = {
+            DYLD_CHAINED_IMPORT_FORMAT.UNCOMPRESSED: ('<I', 4),
+            DYLD_CHAINED_IMPORT_FORMAT.COMPRESSED: ('<I', 4),
+            DYLD_CHAINED_IMPORT_FORMAT.COMPRESSED_64: ('<Q', 8),
+        }[cmd.imports_format]
+
+        name_offset_bits = 24 if cmd.imports_format == DYLD_CHAINED_IMPORT_FORMAT.COMPRESSED_64 else 23
+        name_offset_mask = (1 << name_offset_bits) - 1
+
+        for i in range(cmd.imports_count):
+            pos = cmd.imports_offset + i * entry_size
+            if pos + entry_size > len(chain_data):
+                print('Warning: chained fixups import table is truncated at entry {:d}'.format(i))
+                break
+            raw, = struct.unpack(entry_fmt, chain_data[pos : pos + entry_size])
+
+            lib_ordinal = raw & 0xFF
+            if lib_ordinal > 0x7F:
+                lib_ordinal = lib_ordinal - 0x100       #int8_t, negative means a special ordinal
+            weak_import = (raw >> 8) & 0x1
+            name_offset = (raw >> 9) & name_offset_mask
+
+            addend = 0
+            if cmd.imports_format == DYLD_CHAINED_IMPORT_FORMAT.COMPRESSED:
+                addend, _ = leb128.decode_sleb128(chain_data[pos + 4 : len(chain_data)], len(chain_data) - (pos + 4))
+            elif cmd.imports_format == DYLD_CHAINED_IMPORT_FORMAT.COMPRESSED_64:
+                addend, _ = leb128.decode_sleb128(chain_data[pos + 8 : len(chain_data)], len(chain_data) - (pos + 8))
+
+            imports.append((lib_ordinal, weak_import, name_offset, addend))
+        return imports
+
+    #Read a NUL terminated string out of the chained fixups symbol string pool
+    def __get_chained_fixups_symbol(self, cmd, chain_data, name_offset):
+        pos = cmd.symbols_offset + name_offset
+        end = chain_data.find(b'\x00', pos)
+        if end < 0:
+            end = len(chain_data)
+        return bytes_to_str(chain_data[pos:end])
+
+    '''
+    struct dyld_chained_starts_in_image
+    {
+        uint32_t    seg_count;
+        uint32_t    seg_info_offset[seg_count];  // each entry is offset into this or zero
+    };
+
+    NOTE: despite the wording in the header, dyld treats seg_info_offset as an offset
+    from the beginning of the LC_DYLD_CHAINED_FIXUPS payload, not from this structure:
+        infoStart = (dyld_chained_starts_in_segment*)((uint8_t*)fixupsHeader + segInfoOffset)
+    '''
+    #Collect the chain starts of every segment
+    def __parse_chained_starts_in_image(self, chain_data, starts_offset):
+        starts_in_segments = []
+        if starts_offset + 4 > len(chain_data):
+            print('Warning: missing dyld_chained_starts_in_image in chained fixups payload')
+            return starts_in_segments
+
+        seg_count, = struct.unpack('<L', chain_data[starts_offset : starts_offset + 4])
+        pos = starts_offset + 4
+        if pos + seg_count * 4 > len(chain_data):
+            print('Warning: truncated dyld_chained_starts_in_image, {:d} segments expected'.format(seg_count))
+            seg_count = (len(chain_data) - pos) // 4
+
+        for i in range(seg_count):
+            seg_info_offset, = struct.unpack('<L', chain_data[pos : pos + 4])
+            pos = pos + 4
+            if seg_info_offset == 0:
+                starts_in_segments.append(None)       #segment without any fixup
+                continue
+            starts_in_segments.append(self.__parse_chained_starts_in_segment(chain_data, seg_info_offset))
+        return starts_in_segments
+
+    def __parse_chained_starts_in_segment(self, chain_data, seg_info_pos):
+        if seg_info_pos + DYLD_CHAINED_STARTS_IN_SEGMENT.SIZE > len(chain_data):
+            print('Warning: truncated dyld_chained_starts_in_segment')
+            return None
+
+        size, page_size, pointer_format, segment_offset, max_valid_pointer, page_count = \
+            struct.unpack('<LHHQLL', chain_data[seg_info_pos : seg_info_pos + DYLD_CHAINED_STARTS_IN_SEGMENT.HEADER_SIZE])
+
+        try:
+            ptr_format = DYLD_CHAINED_PTR_FORMAT(pointer_format)
+        except ValueError:
+            print('Warning: unknown chained pointer format {:d}'.format(pointer_format))
+            ptr_format = DYLD_CHAINED_PTR_FORMAT.NONE
+
+        page_start_off = seg_info_pos + DYLD_CHAINED_STARTS_IN_SEGMENT.HEADER_SIZE
+        starts = DYLD_CHAINED_STARTS_IN_SEGMENT(size, page_size, ptr_format, segment_offset, max_valid_pointer, page_count, page_start_off)
+
+        for i in range(page_count):
+            if page_start_off + (i + 1) * 2 > len(chain_data):
+                print('Warning: truncated page start array, {:d} of {:d} pages read'.format(i, page_count))
+                break
+            page_start, = struct.unpack('<H', chain_data[page_start_off + i * 2 : page_start_off + (i + 1) * 2])
+            starts.page_start.append(page_start)
+
+        if starts.page_size == 0:
+            starts.page_size = 0x1000
+        if starts.page_count > 0 and starts.ptr_size() == None:
+            print('Warning: chained pointer format {:s} is not supported, fixups of segment at 0x{:X} ignored'.format(
+                starts.pointer_format.name, segment_offset))
+        return starts
+
+    '''
+    struct dyld_chained_ptr64_rebase { uint64_t target:36, high8:8, reserved:7, next:12, bind:1; };
+    struct dyld_chained_ptr64_bind   { uint64_t ordinal:24, addend:8, reserved:19, next:12, bind:1; };
+    struct dyld_chained_ptr_arm64e_rebase { uint64_t target:43, high8:8, reserved:2, next:11, bind:1; };
+    struct dyld_chained_ptr_arm64e_bind   { uint64_t ordinal:16, addend:8, reserved:7, cacheLevel:2, diversity:12,
+                                             addrDiv:1, key:2, next:11, bind:1; };
+    struct dyld_chained_ptr_arm64e_bind24 { uint64_t ordinal:24, addend:8, reserved:19, cacheLevel:2, next:11, bind:1; };
+    struct dyld_chained_ptr64_offset_rebase { uint64_t target:43, high8:8, reserved:7, next:4, bind:1, fixup:1; };
+    struct dyld_chained_ptr64_kernel_cache_rebase { uint64_t target:30, cacheLevel:2, diversity:11, addrDiv:1,
+                                                    key:2, next:12, isBind:1, fixup:1; };
+    struct dyld_chained_ptr32_rebase { uint32_t target:26, next:5, bind:1; };
+    struct dyld_chained_ptr32_bind   { uint32_t ordinal:20, next:5, bind:1; };
+    struct dyld_chained_ptr32_cache_rebase { uint32_t target:30, next:1, bind:1; };
+    struct dyld_chained_ptr32_firmware_rebase { uint32_t target:26, next:6; };
+    '''
+    #Decode one chained pointer. Returns a dict with the bind flag, the next chain offset
+    #and either the imported symbol ordinal/addend (bind) or the raw target (rebase).
+    def __decode_chained_pointer(self, fmt, raw, ptr_size):
+        entry = {'bind': False, 'next': 0, 'ordinal': 0, 'addend': 0, 'target': 0}
+
+        if fmt == DYLD_CHAINED_PTR_FORMAT.ARM64 or fmt == DYLD_CHAINED_PTR_FORMAT.ARM64_32:
+            entry['next'] = (raw >> 51) & 0xFFF
+            if (raw >> 63) & 1:
+                entry['bind'] = True
+                entry['ordinal'] = raw & 0xFFFFFF
+                entry['addend'] = (raw >> 24) & 0xFF
+            else:
+                entry['target'] = raw & 0xFFFFFFFFF
+                entry['target'] |= ((raw >> 43) & 0xFF) << 36
+
+        elif fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_USERLAND or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_CACHEABLE or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_USERLAND24:
+            entry['next'] = (raw >> 51) & 0x7FF
+            if (raw >> 63) & 1:
+                entry['bind'] = True
+                if fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_USERLAND24:
+                    entry['ordinal'] = raw & 0xFFFFFF
+                else:
+                    entry['ordinal'] = raw & 0xFFFF
+                entry['addend'] = (raw >> 24) & 0xFF
+            else:
+                entry['target'] = raw & 0x7FFFFFFFFFF
+                entry['target'] |= ((raw >> 43) & 0xFF) << 36
+
+        elif fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_FIRMWARE or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_KERNEL or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_KERNEL64:
+            #fixup bit is bit 0, the chain ends when the target is zero
+            entry['next'] = 0
+            if (raw >> 62) & 1:
+                entry['next'] = (raw >> 51) & 0xFFF
+            entry['target'] = raw & 0x3FFFFFFF
+            if fmt == DYLD_CHAINED_PTR_FORMAT.ARM64E_KERNEL64:
+                entry['target'] = raw & 0x3FFFFFFFFF
+                entry['target'] |= ((raw >> 43) & 0xFF) << 36
+
+        elif fmt == DYLD_CHAINED_PTR_FORMAT.X86_64_CACHEABLE or \
+            fmt == DYLD_CHAINED_PTR_FORMAT.X86_64_KERNEL_CACHEABLE:
+            entry['next'] = (raw >> 51) & 0xFFF
+            if (raw >> 63) & 1:
+                entry['bind'] = True
+                entry['ordinal'] = raw & 0xFFFFFF
+                entry['addend'] = (raw >> 24) & 0xFF
+            else:
+                entry['target'] = raw & 0xFFFFFFFFF
+                entry['target'] |= ((raw >> 43) & 0xFF) << 36
+
+        else:
+            #32-bit formats
+            entry['next'] = (raw >> 26) & 0x1F
+            if fmt == DYLD_CHAINED_PTR_FORMAT.ARM64_32_KERNEL_CACHEABLE:
+                entry['next'] = (raw >> 30) & 0x1
+                entry['target'] = raw & 0x3FFFFFFF
+            elif (raw >> 31) & 1:
+                entry['bind'] = True
+                entry['ordinal'] = raw & 0xFFFFF
+            else:
+                entry['target'] = raw & 0x3FFFFFF
+
+        return entry
+
+    #Walk every fixup page of every segment and call fixup_function once per chained pointer.
+    #fixup_function(seg_idx, seg_off, ptr_vmaddr, target_vmaddr, dylib, symbol, addend)
+    #ptr_vmaddr is the address the pointer itself lives at, target_vmaddr the value it has to
+    #be fixed up to. For a bind entry symbol/dylib/addend are set and target_vmaddr is only
+    #known once the virtual section has been built, so it is 0 during the first pass.
+    def __build_chained_fixups_info(self, fixup_function):
+        cmd = self.__chained_fixups.header
+        chain_data = self.__chained_fixups_data
+
+        for seg_idx in range(len(self.__chained_fixups.starts_in_segments)):
+            if seg_idx >= len(self.__segments):
+                break
+            starts = self.__chained_fixups.starts_in_segments[seg_idx]
+            if starts == None or not starts.is_decodable():
+                continue
+
+            segment = self.__segments[seg_idx]
+            ptr_size = starts.ptr_size()
+            ptr_fmt = '<Q' if ptr_size == 8 else '<L'
+
+            for page_idx in range(starts.page_count):
+                if page_idx >= len(starts.page_start):
+                    break
+                page_start = starts.page_start[page_idx]
+                if page_start == DYLD_CHAINED_STARTS_IN_PAGE_END or page_start == DYLD_CHAINED_STARTS_IN_PAGE_NO_REBIND:
+                    continue
+
+                page_file_off = self.__mh_offset + segment.offset + page_idx * starts.page_size * 4
+                page_seg_off = page_idx * starts.page_size * 4
+
+                next_off = page_start
+                while True:
+                    seg_off = page_seg_off + next_off
+                    self.__fd.seek(page_file_off + next_off)
+                    raw_bytes = self.__fd.read(ptr_size)
+                    if len(raw_bytes) != ptr_size:
+                        print('Warning: chained fixups walk ran past the end of the file')
+                        break
+                    raw, = struct.unpack(ptr_fmt, raw_bytes)
+
+                    entry = self.__decode_chained_pointer(starts.pointer_format, raw, ptr_size)
+
+                    if entry['bind'] == True:
+                        lib_ordinal = entry['ordinal']
+                        addend = entry['addend']
+                        symbol = None
+                        dylib = None
+                        if 0 < lib_ordinal <= cmd.imports_count:
+                            imp_ordinal, weak_import, name_offset, imp_addend = cmd.imports[lib_ordinal - 1]
+                            symbol = self.__get_chained_fixups_symbol(cmd, chain_data, name_offset)
+                            addend = addend + imp_addend
+                            dylib = self.get_chained_dylib_by_ordinal(imp_ordinal)
+                            if dylib == None:
+                                print('Warning: chained bind {:s} uses unsupported library ordinal {:d}'.format(symbol, imp_ordinal))
+                        else:
+                            print('Warning: chained bind with out of range ordinal {:d} at 0x{:X}'.format(
+                                lib_ordinal, segment.vmaddr + seg_off))
+                        fixup_function(seg_idx, seg_off, segment.vmaddr + seg_off, 0, dylib, symbol, addend)
+                    else:
+                        #user space formats store the absolute unslid vmaddr, the kernel and
+                        #firmware formats an offset relative to the preferred segment address
+                        target_vmaddr = starts.rebase_target(entry['target'])
+                        fixup_function(seg_idx, seg_off, segment.vmaddr + seg_off, target_vmaddr, None, None, 0)
+
+                    if entry['next'] == 0:
+                        break
+                    next_off = next_off + entry['next'] * ptr_size
+                    if next_off >= starts.page_size * 4:
+                        break
+
+    def __chained_fixups_bind_pass1(self, seg_idx, seg_off, ptr_vmaddr, target_vmaddr, dylib, symbol, addend):
+        #build the import table out of the chained fixup bind entries
+        if symbol == None or dylib == None:
+            return
+        dylib.append_symbol(symbol)
+
+    def __chained_fixups_bind_pass2(self, seg_idx, seg_off, ptr_vmaddr, target_vmaddr, dylib, symbol, addend):
+        #write the resolved vmaddr back into the in memory copy of the section
+        if symbol != None:
+            target = self.get_virtual_map_addr(symbol)
+            if target == None:
+                return
+            #TODO: the addend of a chained bind is not applied, the virtual section
+            #data structure would have to carry it like the dyld_info path does
+        else:
+            target = target_vmaddr
+
+        section, position = self.get_section_position(seg_idx, seg_off)
+        if section == None or section.data == None:
+            return
+
+        if self.__is_64bit_cpu == True:
+            length = 8
+            addr_str = struct.pack(self.__endian_str + 'Q', target)
+        else:
+            length = 4
+            addr_str = struct.pack(self.__endian_str + 'L', target)
+
+        if position < 0 or position + length > len(section.data):
+            return
+
+        section.data = section.data[0 : position] + addr_str + section.data[position + length :]
+        #print '0x{:X} chained fixup to 0x{:X}'.format(segment.vmaddr + seg_off, target)
 
     #Load binding information and build up a binding table which is a list of vmaddr to imported symbol mapping
     #This is a simple implementation
@@ -459,31 +899,56 @@ class MachOAnalyzer:
     #Search for segment  LOAD_COMMAND_SEGMENT or LOAD_COMMAND_SEGMENT64 with segment index
     #Generally __ZEROPAGE is indexed by 0, __TEXT by 1, __DATA by 2 and __LINKEDIT by 3
     def get_segment(self, seg_idx):
+        if seg_idx == None or seg_idx < 0 or seg_idx >= len(self.__segments):
+            return None
         return self.__segments[seg_idx]
     
+    #Return the section of a segment that contains seg_off, an offset relative to the
+    #beginning of the segment. The sections of a segment are not necessarily contiguous
+    #and a segment does not have to start with a section, so the offset of every section
+    #within the segment is what decides, not the sum of the section sizes.
     def get_section_by_addr(self, seg_idx, seg_off):
-        size = 0
-        for section in self.__segments[seg_idx].sections:
-            size = size + section.vmsize
-            if seg_off < size:
+        segment = self.get_segment(seg_idx)
+        if segment == None:
+            return None
+        for section in segment.sections:
+            section_seg_off = section.offset - segment.offset
+            if section_seg_off <= seg_off < section_seg_off + section.vmsize:
                 return section
+        return None
+
+    #Offset of a segment relative position inside the data buffer of its section
+    def get_section_position(self, seg_idx, seg_off):
+        segment = self.get_segment(seg_idx)
+        section = self.get_section_by_addr(seg_idx, seg_off)
+        if segment == None or section == None:
+            return None, None
+        return section, seg_off - (section.offset - segment.offset)
 
     def __bind_pass1(self, seg_idx, seg_off, type, lib_ordinal, addend, symbol):
-        dylib = self.get_dylib(lib_ordinal - 1)
+        dylib = self.get_dylib_by_ordinal(lib_ordinal)
+        if dylib == None:
+            print('Warning: bind {:s} refers to unknown library ordinal {:d}'.format(symbol, lib_ordinal))
+            return
         dylib.append_symbol(symbol)
         
     def __bind_pass2(self, seg_idx, seg_off, type, lib_ordinal, addend, symbol):
-        segment = self.get_segment(seg_idx)
-        section = self.get_section_by_addr(seg_idx, seg_off)
+        section, position = self.get_section_position(seg_idx, seg_off)
+        if section == None or section.data == None:
+            return
         symbol_addr = self.get_virtual_map_addr(symbol)
+        if symbol_addr == None:
+            return
 
-        position = seg_off - (section.vmaddr - segment.vmaddr)
         if self.__is_64bit_cpu == True:
             length = 8
             addr_str = struct.pack(self.__endian_str + 'Q', symbol_addr)
         else:
             length = 4
             addr_str = struct.pack(self.__endian_str + 'L', symbol_addr)
+
+        if position < 0 or position + length > len(section.data):
+            return
 
         #TODO: addend
         data = section.data[0 : position] + addr_str + section.data[position + length:]
@@ -497,6 +962,8 @@ class MachOAnalyzer:
                 print('    ', symbol)
 
     def __build_virtual_section(self):
+        if len(self.__segments) == 0:
+            return []
         segment = self.__segments[-1]
         addr = segment.vmaddr + segment.vmsize
 
@@ -512,6 +979,9 @@ class MachOAnalyzer:
         return vsec
 
     def is_virtual_section_addr(self, addr):
+        #a binary without any imported symbol has an empty virtual section
+        if len(self.__virtual_section) == 0:
+            return False
         return addr >= self.__virtual_section[0].addr
         
     def get_virtual_map_addr(self, symbol):
@@ -525,7 +995,8 @@ class MachOAnalyzer:
                 idx = (addr - self.__virtual_section[0].addr) // 8
             else:
                 idx = (addr - self.__virtual_section[0].addr) // 4
-            return self.__virtual_section[idx].symbol
+            if idx < len(self.__virtual_section):
+                return self.__virtual_section[idx].symbol
         return None
         
     def dump_virtual_section(self):
@@ -759,15 +1230,23 @@ class MachOAnalyzer:
 
         position = vmaddr - section.vmaddr
         flags, inst_start, inst_size = struct.unpack(self.__endian_str + 'LLL', section.data[position : position + 12])
-        position = position + 12
-        
+
         if self.__is_64bit_cpu == True:
-            reserved, ivar_layout_ptr, cls_name_ptr, base_methods_ptr, base_protocols_ptr, ivars_ptr, weak_ivar_layout_ptr, base_properties_ptr = \
-                struct.unpack(self.__endian_str + 'LQQQQQQQ', section.data[position : position + 60])
-        else:
+            #class_ro is 4 uint32 (flags, instanceStart, instanceSize, reserved) followed by
+            #4 bytes of padding and then the 7 pointers, 72 bytes in total. The reserved word
+            #and the pointers are read separately on purpose: struct aligns every field of a
+            #'<' format to its own size, so a mixed 'LQQQQQQQ' format places the second Q at
+            #offset 12 instead of 8 and reports a size of 60 instead of 64.
+            reserved, = struct.unpack(self.__endian_str + 'L', section.data[position + 12 : position + 16])
             ivar_layout_ptr, cls_name_ptr, base_methods_ptr, base_protocols_ptr, ivars_ptr, weak_ivar_layout_ptr, base_properties_ptr = \
-                struct.unpack(self.__endian_str + 'LLLLLLL', section.data[position : position + 28])
+                struct.unpack(self.__endian_str + 'QQQQQQQ', section.data[position + 16 : position + 72])
+            position = position + 72
+        else:
+            #the 32-bit class_ro has no reserved field and no padding, 28 bytes in total
+            ivar_layout_ptr, cls_name_ptr, base_methods_ptr, base_protocols_ptr, ivars_ptr, weak_ivar_layout_ptr, base_properties_ptr = \
+                struct.unpack(self.__endian_str + 'LLLLLLL', section.data[position + 12 : position + 40])
             reserved = None
+            position = position + 40
         
 
         if ivar_layout_ptr != 0:
@@ -872,16 +1351,22 @@ class MachOAnalyzer:
         objc2_class.superclass = superclass
         objc2_class.superclass_name = superclass_name
                 
+        #an address of the virtual section that cannot be mapped back to a symbol is
+        #printed as a plain address instead of leaving the field empty
         if self.is_virtual_section_addr(cache_ptr):
             cache_name = self.get_virtual_map_symbol(cache_ptr)
         else:
-            cache_name = '{:d}'.format(cache_ptr)
+            cache_name = None
+        if cache_name == None:
+            cache_name = '0x{:X}'.format(cache_ptr)
         objc2_class.cache_name = cache_name
 
         if self.is_virtual_section_addr(vtable_ptr):
             vtable_name = self.get_virtual_map_symbol(vtable_ptr)
         else:
-            vtable_name = '{:d}'.format(vtable_ptr)
+            vtable_name = None
+        if vtable_name == None:
+            vtable_name = '0x{:X}'.format(vtable_ptr)
         objc2_class.vtable_name = vtable_name
 
         self.__objc2_cls_stack.pop()
@@ -889,6 +1374,8 @@ class MachOAnalyzer:
         
     def __build_objc2_clslist(self):
         section = self.get_section_by_name('__DATA', '__objc_classlist')
+        if section == None:
+            return []
 
         if self.__is_64bit_cpu == True:
             n_cls = section.vmsize // 8
@@ -904,6 +1391,9 @@ class MachOAnalyzer:
             else:
                 objc2_cls_ptr, = struct.unpack(self.__endian_str + 'L', section.data[position : position + 4 :])
                 position = position + 4
+            #an empty or foreign entry must not be walked as a class object
+            if objc2_cls_ptr == 0 or not self.is_objc2_class_addr(objc2_cls_ptr):
+                continue
             objc2_cls = self.__build_objc2_cls(objc2_cls_ptr)
             cls_list.append(objc2_cls)
 
@@ -911,6 +1401,8 @@ class MachOAnalyzer:
 
     def __build_objc2_nlclslist(self):
         section = self.get_section_by_name('__DATA', '__objc_nlclslist')
+        if section == None:
+            return []
 
         if self.__is_64bit_cpu == True:
             n_cls = section.vmsize // 8
@@ -926,6 +1418,9 @@ class MachOAnalyzer:
             else:
                 objc2_cls_ptr, = struct.unpack(self.__endian_str + 'L', section.data[position : position + 4 :])
                 position = position + 4
+            #an empty or foreign entry must not be walked as a class object
+            if objc2_cls_ptr == 0 or not self.is_objc2_class_addr(objc2_cls_ptr):
+                continue
             objc2_cls = self.__build_objc2_cls(objc2_cls_ptr)
             cls_list.append(objc2_cls)
 
@@ -951,6 +1446,9 @@ class MachOAnalyzer:
 
     def dump_section_objc_selrefs(self):
         section = self.get_section_by_name('__DATA', '__objc_selrefs')
+        if section == None:
+            print('section __DATA,__objc_selrefs not found')
+            return
 
         if self.__is_64bit_cpu == True:
             ref_size = 8
@@ -971,6 +1469,13 @@ class MachOAnalyzer:
             print('0x{:X}: __objc_methname(\'{:s}\')'.format(address, method_name))
             address = address + ref_size
 
+    #True if vmaddr points into the __objc_data section, where the class objects live
+    def is_objc2_class_addr(self, vmaddr):
+        section = self.get_section_by_name('__DATA', '__objc_data')
+        if section == None:
+            return False
+        return section.vmaddr <= vmaddr < (section.vmaddr + section.vmsize)
+
     def get_objc_class_ref(self, vmaddr):
         for objc_class in self.__objc_classlist:
             if vmaddr == objc_class.vmaddr:
@@ -984,6 +1489,9 @@ class MachOAnalyzer:
         
     def dump_section_objc_classrefs(self):
         section = self.get_section_by_name('__DATA', '__objc_classrefs')
+        if section == None:
+            print('section __DATA,__objc_classrefs not found')
+            return
 
         if self.__is_64bit_cpu == True:
             ref_size = 8
@@ -1010,6 +1518,9 @@ class MachOAnalyzer:
 
     def dump_section_objc_superrefs(self):
         section = self.get_section_by_name('__DATA', '__objc_superrefs')
+        if section == None:
+            print('section __DATA,__objc_superrefs not found')
+            return
 
         if self.__is_64bit_cpu == True:
             ref_size = 8
@@ -1036,6 +1547,9 @@ class MachOAnalyzer:
 
     def dump_section_objc_ivar(self):
         section = self.get_section_by_name('__DATA', '__objc_ivar')
+        if section == None:
+            print('section __DATA,__objc_ivar not found')
+            return
 
         ivar_size = 4
             
@@ -1068,6 +1582,9 @@ class MachOAnalyzer:
     '''
     def dump_section_cfstring(self):
         section = self.get_section_by_name('__DATA', '__cfstring')
+        if section == None:
+            print('section __DATA,__cfstring not found')
+            return
 
         if self.__is_64bit_cpu == True:
             cfstring_size = 32
@@ -1087,7 +1604,9 @@ class MachOAnalyzer:
             if self.is_virtual_section_addr(isa):
                 isa_name = self.get_virtual_map_symbol(isa)
             else:
-                isa_name = '0x:{:X}'.format(isa)
+                isa_name = None
+            if isa_name == None:
+                isa_name = '0x{:X}'.format(isa)
 
             c_str = self.get_cstring(str)
 
