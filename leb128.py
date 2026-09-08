@@ -5,7 +5,8 @@ def decode_leb128(data, sign, max_len):
     byte = 0
 
     while num_read < max_len:
-        byte = ord(data[num_read])
+        #data is expected to be a bytes object, indexing yields an int in Python 3
+        byte = data[num_read]
         num_read = num_read + 1
 
         result = result | ((byte & 0x7F) << shift)
@@ -18,7 +19,7 @@ def decode_leb128(data, sign, max_len):
     if (sign and (byte & 0x40)):
         result = result | (-(1 << shift))
     return result, num_read
-    
+
 
 def decode_uleb128(data, max_len):
     return decode_leb128(data, False, max_len)
@@ -27,22 +28,22 @@ def decode_sleb128(data, max_len):
     return decode_leb128(data, True, max_len)
 
 def main():
-    testcase1 = '\x80\x01'
-    testcase2 = '\xa0\x23'
-    testcase3 = '\xb8\xff\xff\xff\xff\xff\xff\xff\xff\x01'
-    testcase4 = '\xdc\xff\xff\xff\xff\xff\xff\xff\xff\x01'
-    testcase5 = '\x9B\xF1\x59'
+    testcase1 = b'\x80\x01'
+    testcase2 = b'\xa0\x23'
+    testcase3 = b'\xb8\xff\xff\xff\xff\xff\xff\xff\xff\x01'
+    testcase4 = b'\xdc\xff\xff\xff\xff\xff\xff\xff\xff\x01'
+    testcase5 = b'\x9b\xf1\x59'
     testset = (testcase1, testcase2, testcase3, testcase4)
     for testcase in testset:
         result, num_read = decode_uleb128(testcase, len(testcase))
         if result & 0x8000000000000000:
             result = - ((result - 1) ^ 0xffffffffffffffff)
-            
-        print '{:d}'.format(result)
-        print num_read
+
+        print('{:d}'.format(result))
+        print(num_read)
 
     result, num_read = decode_sleb128(testcase5, len(testcase5))
-    print result
-    print num_read
+    print(result)
+    print(num_read)
 if __name__ == '__main__':
     main()

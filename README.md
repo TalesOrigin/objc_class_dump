@@ -10,7 +10,7 @@ So I developed an objc_class_dump with Python from scrath.
 
 This tool not only dumps the hierarchy of all object-c classes but also dumps raw information of some other sections.
 
-It was developed with Python 2.7 and tested with Mach-O file with arm and aarch64 architecture.
+It was developed with Python 3.7+ and tested with Mach-O file with arm and aarch64 architecture.
 
 How it works:
 

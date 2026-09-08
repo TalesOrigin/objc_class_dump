@@ -2,6 +2,8 @@ import os
 import struct
 from enum import Enum
 
+from exception import UnknownMagic
+
 class MACH_O_LOAD_COMMAND_TYPE(Enum):
     SEGMENT = 0x1           #File segment to be mapped.
     SYMTAB = 0x2            #Link-edit stab symbol table info (obsolete).
@@ -175,10 +177,10 @@ class MachHeader:
     };
     '''
     def __init__(self, mach_o_file, file_offset):
-        __MH_MAGIC = '\xfe\xed\xfa\xce'
-        __MH_CIGAM = '\xce\xfa\xed\xfe'
-        __MH_MAGIC_64 = '\xfe\xed\xfa\xcf'
-        __MH_CIGAM_64 = '\xcf\xfa\xed\xfe'
+        __MH_MAGIC = b'\xfe\xed\xfa\xce'
+        __MH_CIGAM = b'\xce\xfa\xed\xfe'
+        __MH_MAGIC_64 = b'\xfe\xed\xfa\xcf'
+        __MH_CIGAM_64 = b'\xcf\xfa\xed\xfe'
         
         mach_o_file.seek(file_offset)
 

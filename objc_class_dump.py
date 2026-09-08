@@ -8,6 +8,12 @@ from fat_header import FatHeader
 from mach_header import *
 from objc import *
 
+#Section and string data is read as raw bytes from the Mach-O file,
+#decode it to str for display and comparison purposes.
+#backslashreplace keeps the decoding lossless for any malformed bytes.
+def bytes_to_str(data):
+    return data.decode('utf-8', 'backslashreplace')
+
 class MachOAnalyzer:
     def __init__(self, file, cpu_type=MACH_O_CPU_TYPE.ARM64):
         self.__fd = file
@@ -15,15 +21,15 @@ class MachOAnalyzer:
         try:
             self.__fat_header = FatHeader(self.__fd)
 
-            print 'FAT Mach-O detected'
+            print('FAT Mach-O detected')
             fat_arch = self.__fat_header.get_arch(cpu_type)
             if fat_arch == None:
-                print 'No arch for', cpu_type, ' in FAT Header'
+                print('No arch for', cpu_type, ' in FAT Header')
                 fat_arch = self.__fat_header.get_arch()
-                print 'Using the first avaiable arch:', fat_arch.get_cpu_type() 
+                print('Using the first avaiable arch:', fat_arch.get_cpu_type())
             self.__mh_offset = fat_arch.get_file_offset()
         except UnknownMagic:
-            print 'Mach-O detected'
+            print('Mach-O detected')
             self.__mh_offset = 0
 
         self.__mach_header = MachHeader(self.__fd, self.__mh_offset)
@@ -153,28 +159,28 @@ class MachOAnalyzer:
             if self.__is_64bit_cpu == True and MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.SEGMENT_64:
                 name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags = \
                     struct.unpack(self.__endian_str + '16sQQQQLLLL', self.__fd.read(64))
-                name = name.strip('\x00')
+                name = bytes_to_str(name.strip(b'\x00'))
                 segment = Segment(name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags)
                 segments.append(segment)
                 
                 for j in range(nsects):
                     sec_name, name, vmaddr, vmsize, offset, alignment, reloff, nreloc, flags, reserved1, reserved2, reserved3 = \
                         struct.unpack(self.__endian_str + '16s16sQQLLLLLLLL', self.__fd.read(80))
-                    sec_name = sec_name.strip('\x00')
+                    sec_name = bytes_to_str(sec_name.strip(b'\x00'))
                     section = Section(sec_name, vmaddr, vmsize, offset, alignment, reloff, nreloc, flags, reserved1, reserved2, reserved3)
                     segment.append_section(section)
                     
             elif self.__is_64bit_cpu == False and MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.SEGMENT:
                 name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags = \
                     struct.unpack(self.__endian_str + '16sLLLLLLLL', self.__fd.read(48))
-                name = name.strip('\x00')
+                name = bytes_to_str(name.strip(b'\x00'))
                 segment = Segment(name, vmaddr, vmsize, offset, filesize, maxprot, initprot, nsects, flags)
                 segments.append(segment)
 
                 for j in range(nsects):
                     sec_name, name, vmaddr, vmsize, offset, alignment, reloff, nreloc, flags, reserved1, reserved2 = \
                         struct.unpack(self.__endian_str + '16s16sLLLLLLLLL', self.__fd.read(68))
-                    sec_name = sec_name.strip('\x00')
+                    sec_name = bytes_to_str(sec_name.strip(b'\x00'))
                     section = Section(sec_name, vmaddr, vmsize, offset, alignment, reloff, nreloc, flags, reserved1, reserved2)
                     segment.append_section(section)
             else:
@@ -214,16 +220,16 @@ class MachOAnalyzer:
                 (MACH_O_LOAD_COMMAND_TYPE(type) == MACH_O_LOAD_COMMAND_TYPE.WEAK_DYLIB):
                 off, ts, cur_ver, compat_ver = struct.unpack(self.__endian_str + 'LLLL', self.__fd.read(16))
 
-                c_str = ''
+                c_str = b''
                 while True:
                     c = self.__fd.read(1)
-                    if ord(c) == 0:
+                    if not c or c == b'\x00':
                         break
                     c_str = c_str + c
 
                 self.__fd.seek(lc_len - 8 - 16 - len(c_str) - 1, os.SEEK_CUR)
                 
-                dylib = DYLib(ts, cur_ver, compat_ver, c_str)
+                dylib = DYLib(ts, cur_ver, compat_ver, bytes_to_str(c_str))
                 dylibs.append(dylib)
             else:
                 self.__fd.seek(lc_len - 8, os.SEEK_CUR)
@@ -304,11 +310,11 @@ class MachOAnalyzer:
         skip = None
         while i < bind_size:
             byte = bind_data[i]
-            opcode = ord(byte) & DYLD_INFO_BIND_OPCODE.OPCODE_MASK.value
+            opcode = byte & DYLD_INFO_BIND_OPCODE.OPCODE_MASK.value
             opcode = DYLD_INFO_BIND_OPCODE(opcode)
-            imm = ord(byte) & DYLD_INFO_BIND_OPCODE.IMMEDIATE_MASK.value
+            imm = byte & DYLD_INFO_BIND_OPCODE.IMMEDIATE_MASK.value
 
-            debug_str = '[0x{:x}] 0x{:x}:'.format(i, ord(byte))
+            debug_str = '[0x{:x}] 0x{:x}:'.format(i, byte)
             i = i + 1
             if opcode == DYLD_INFO_BIND_OPCODE.DONE:
 
@@ -335,7 +341,7 @@ class MachOAnalyzer:
                 #Have no idea about how to handle negative or zero library ordinal
                 #So print and raise an exception here
                 if imm != 0:
-                    lib_ordinal = imm | DYLD_INFO_BIND_OPCODE.OPCODE_MASK
+                    lib_ordinal = imm | DYLD_INFO_BIND_OPCODE.OPCODE_MASK.value
                 else:
                     lib_ordinal = imm
 
@@ -344,11 +350,12 @@ class MachOAnalyzer:
                 raise UnsupportBindOpcode(byte)
                     
             elif opcode == DYLD_INFO_BIND_OPCODE.SET_SYMBOL_TRAILING_FLAGS_IMM:
-                symbol = ''
-                while ord(bind_data[i]) != 0:
-                    symbol = symbol + bind_data[i]
+                symbol_bytes = b''
+                while bind_data[i] != 0:
+                    symbol_bytes = symbol_bytes + bind_data[i:i+1]
                     i = i + 1
                 i = i + 1
+                symbol = bytes_to_str(symbol_bytes)
 
                 debug_str = debug_str + 'set symbol imm: 0x{:x}, {:s}'.format(imm, symbol)
                 #print debug_str
@@ -446,7 +453,7 @@ class MachOAnalyzer:
             else:
                 raise UnsupportBindOpcode(byte)
         #bind commands without end
-        print 'bind commands without end'
+        print('bind commands without end')
         return
 
     #Search for segment  LOAD_COMMAND_SEGMENT or LOAD_COMMAND_SEGMENT64 with segment index
@@ -485,9 +492,9 @@ class MachOAnalyzer:
 
     def dump_import_table(self):
         for dylib in self.__dylibs:
-            print dylib.name
+            print(dylib.name)
             for symbol in dylib.symbols:
-                print '    ', symbol
+                print('    ', symbol)
 
     def __build_virtual_section(self):
         segment = self.__segments[-1]
@@ -515,16 +522,15 @@ class MachOAnalyzer:
     def get_virtual_map_symbol(self, addr):
         if self.is_virtual_section_addr(addr):
             if self.__is_64bit_cpu == True:
-                idx = (addr - self.__virtual_section[0].addr) / 8
+                idx = (addr - self.__virtual_section[0].addr) // 8
             else:
-                idx = (addr - self.__virtual_section[0].addr) / 4
+                idx = (addr - self.__virtual_section[0].addr) // 4
             return self.__virtual_section[idx].symbol
         return None
         
-
     def dump_virtual_section(self):
         for vmap in self.__virtual_section:
-            print '0x{:X}:{:s}'.format(vmap.addr, vmap.symbol)
+            print('0x{:X}:{:s}'.format(vmap.addr, vmap.symbol))
     
     #Search a section with segment name and section name
     def get_section_by_name(self, seg_name, sec_name):
@@ -540,7 +546,7 @@ class MachOAnalyzer:
         assert vmaddr < (section.vmaddr + section.vmsize)
 
         position = vmaddr - section.vmaddr
-        ivar_layout = ord(section.data[position])
+        ivar_layout = section.data[position]
         return ivar_layout
         
     def get_objc2_cls_name(self, vmaddr):
@@ -548,15 +554,15 @@ class MachOAnalyzer:
         assert vmaddr < (section.vmaddr + section.vmsize)
         
         position = vmaddr - section.vmaddr
-        c_str = ''
+        c_str = b''
         
         while True:
             c = section.data[position]
             position = position + 1
-            if ord(c) == 0:
+            if c == 0:
                 break
-            c_str = c_str + c
-        return c_str
+            c_str = c_str + bytes((c,))
+        return bytes_to_str(c_str)
     
     def get_objc2_method_name(self, vmaddr):
         section = self.get_section_by_name('__TEXT', '__objc_methname')
@@ -564,14 +570,14 @@ class MachOAnalyzer:
 
         position = vmaddr - section.vmaddr
         i = 0
-        c_str = ''
+        c_str = b''
         while True:
             c = section.data[position]
             position = position + 1
-            if ord(c) == 0:
+            if c == 0:
                 break
-            c_str = c_str + c
-        return c_str
+            c_str = c_str + bytes((c,))
+        return bytes_to_str(c_str)
 
     def get_objc2_method_type(self, vmaddr):
         section = self.get_section_by_name('__TEXT', '__objc_methtype')
@@ -579,14 +585,14 @@ class MachOAnalyzer:
 
         position = vmaddr - section.vmaddr
         i = 0
-        c_str = ''
+        c_str = b''
         while True:
             c = section.data[position]
             position = position + 1
-            if ord(c) == 0:
+            if c == 0:
                 break
-            c_str = c_str + c
-        return c_str
+            c_str = c_str + bytes((c,))
+        return bytes_to_str(c_str)
 
     '''
     struct objc2_meth
@@ -685,14 +691,14 @@ class MachOAnalyzer:
         assert vmaddr < (section.vmaddr + section.vmsize)
 
         position = vmaddr - section.vmaddr
-        c_str = ''
+        c_str = b''
         while True:
             c = section.data[position]
             position = position + 1
-            if ord(c) == 0:
+            if c == 0:
                 break
-            c_str = c_str + c
-        return c_str
+            c_str = c_str + bytes((c,))
+        return bytes_to_str(c_str)
     
     '''
     struct objc2_property
@@ -885,9 +891,9 @@ class MachOAnalyzer:
         section = self.get_section_by_name('__DATA', '__objc_classlist')
 
         if self.__is_64bit_cpu == True:
-            n_cls = section.vmsize / 8
+            n_cls = section.vmsize // 8
         else:
-            n_cls = section.vmsize / 4
+            n_cls = section.vmsize // 4
 
         cls_list = []
         position = 0
@@ -907,9 +913,9 @@ class MachOAnalyzer:
         section = self.get_section_by_name('__DATA', '__objc_nlclslist')
 
         if self.__is_64bit_cpu == True:
-            n_cls = section.vmsize / 8
+            n_cls = section.vmsize // 8
         else:
-            n_cls = section.vmsize / 4
+            n_cls = section.vmsize // 4
 
         cls_list = []
         position = 0
@@ -928,9 +934,9 @@ class MachOAnalyzer:
     def __build_objc2_protolist(self):
         section = self.get_section_by_name('__DATA', '__objc_protolist')
         if self.__is_64bit_cpu == True:
-            n_proto = section.vmsize / 8
+            n_proto = section.vmsize // 8
         else:
-            n_proto = section.vmsize / 4
+            n_proto = section.vmsize // 4
 
         proto_list = []
         #TODO
@@ -951,7 +957,7 @@ class MachOAnalyzer:
         else:
             ref_size = 4
             
-        nrefs = section.vmsize/ref_size
+        nrefs = section.vmsize // ref_size
 
         address = section.vmaddr
         for i in range(nrefs):
@@ -962,7 +968,7 @@ class MachOAnalyzer:
                 ref, = struct.unpack(self.__endian_str + 'L', section.data[position : position + ref_size])
 
             method_name = self.get_objc2_method_name(ref)
-            print '0x{:X}: __objc_methname(\'{:s}\')'.format(address, method_name)
+            print('0x{:X}: __objc_methname(\'{:s}\')'.format(address, method_name))
             address = address + ref_size
 
     def get_objc_class_ref(self, vmaddr):
@@ -984,7 +990,7 @@ class MachOAnalyzer:
         else:
             ref_size = 4
             
-        nrefs = section.vmsize/ref_size
+        nrefs = section.vmsize // ref_size
 
         address = section.vmaddr
         for i in range(nrefs):
@@ -999,7 +1005,7 @@ class MachOAnalyzer:
             else:
                 objc_class = self.get_objc_class_ref(ref)
                 class_name = objc_class.name
-            print '0x{:X}: {:s}'.format(address, class_name)
+            print('0x{:X}: {:s}'.format(address, class_name))
             address = address + ref_size
 
     def dump_section_objc_superrefs(self):
@@ -1010,7 +1016,7 @@ class MachOAnalyzer:
         else:
             ref_size = 4
             
-        nrefs = section.vmsize/ref_size
+        nrefs = section.vmsize // ref_size
 
         address = section.vmaddr
         for i in range(nrefs):
@@ -1025,7 +1031,7 @@ class MachOAnalyzer:
             else:
                 objc_class = self.get_objc_class_ref(ref)
                 class_name = objc_class.name
-            print '0x{:X}: {:s}'.format(address, class_name)
+            print('0x{:X}: {:s}'.format(address, class_name))
             address = address + ref_size
 
     def dump_section_objc_ivar(self):
@@ -1033,14 +1039,14 @@ class MachOAnalyzer:
 
         ivar_size = 4
             
-        nivar = section.vmsize/ivar_size
+        nivar = section.vmsize // ivar_size
 
         address = section.vmaddr
         for i in range(nivar):
             position = address - section.vmaddr
             ivar, = struct.unpack(self.__endian_str + 'L', section.data[position : position + ivar_size])
 
-            print '0x{:X}: 0x{:X}'.format(address, ivar)
+            print('0x{:X}: 0x{:X}'.format(address, ivar))
             address = address + ivar_size
 
     '''
@@ -1068,7 +1074,7 @@ class MachOAnalyzer:
         else:
             cfstring_size = 16
             
-        ncfstring = section.vmsize/cfstring_size
+        ncfstring = section.vmsize // cfstring_size
 
         address = section.vmaddr
         for i in range(ncfstring):
@@ -1085,7 +1091,7 @@ class MachOAnalyzer:
 
             c_str = self.get_cstring(str)
 
-            print '0x{:X}: __CFString<{:s}, 0x{:X}, \'{:s}\', {:d}>'.format(address, isa_name, flags, c_str, length)
+            print('0x{:X}: __CFString<{:s}, 0x{:X}, \'{:s}\', {:d}>'.format(address, isa_name, flags, c_str, length))
             address = address + cfstring_size
 
 def main():
@@ -1124,7 +1130,7 @@ def main():
     elif options.arch == 'x86_64':
         arch = MACH_O_CPU_TYPE.X86_64
     else:
-        print 'Unknown arch selected, fallback to aarch64'
+        print('Unknown arch selected, fallback to aarch64')
         arch = MACH_O_CPU_TYPE.ARM64
 
     if options.dump_all == True:
@@ -1142,44 +1148,44 @@ def main():
     try:
         mach_o_anylyzer = MachOAnalyzer(fd, arch)
     except UnknownMagic as e:
-        print 'Unknow magic:' + e.value
+        print('Unknow magic:' + str(e))
         fd.close()
         sys.exit(0)
 
     if options.dump_clslist:
-        print '--------------__objc_classlist--------------'
+        print('--------------__objc_classlist--------------')
         mach_o_anylyzer.dump_objc_classlist()
 
     if options.dump_nlclslist:
-        print '--------------__objc_nlclslist--------------'
+        print('--------------__objc_nlclslist--------------')
         mach_o_anylyzer.dump_objc_nlclslist()
 
     if options.dump_selrefs:
-        print '---------------__objc_selrefs---------------'
+        print('---------------__objc_selrefs---------------')
         mach_o_anylyzer.dump_section_objc_selrefs()
 
     if options.dump_classrefs:
-        print '--------------__objc_classrefs--------------'
+        print('--------------__objc_classrefs--------------')
         mach_o_anylyzer.dump_section_objc_classrefs()
 
     if options.dump_superrefs:
-        print '--------------__objc_superrefs--------------'
+        print('--------------__objc_superrefs--------------')
         mach_o_anylyzer.dump_section_objc_superrefs()
 
     if options.dump_ivar:
-        print '----------------__objc_ivar-----------------'
+        print('----------------__objc_ivar-----------------')
         mach_o_anylyzer.dump_section_objc_ivar()
 
     if options.dump_cfstring:
-        print '-----------------__cfstring-----------------'
+        print('-----------------__cfstring-----------------')
         mach_o_anylyzer.dump_section_cfstring()
 
     if options.dump_import_table:
-        print '----------------import_table----------------'
+        print('----------------import_table----------------')
         mach_o_anylyzer.dump_import_table()
 
     if options.dump_vsection:
-        print '---------------virtual_section--------------'
+        print('---------------virtual_section--------------')
         mach_o_anylyzer.dump_virtual_section()
 
     fd.close()

@@ -34,9 +34,9 @@ class ObjC2Class:
             self.name = '_OBJC_METACLASS_$_' + class_data.cls_name
             
     def dump(self):        
-        print '0x{:X}:{:s} __objc2_class<{:s}, {:s}, {:s}, {:s}, {:s}>'.format(\
+        print('0x{:X}:{:s} __objc2_class<{:s}, {:s}, {:s}, {:s}, {:s}>'.format(\
             self.vmaddr, self.name, \
-            self.isa_name, self.superclass_name, self.cache_name, self.vtable_name, self.class_data.name)
+            self.isa_name, self.superclass_name, self.cache_name, self.vtable_name, self.class_data.name))
         self.class_data.dump()
 
         if self.isa != None:
@@ -72,43 +72,42 @@ class ObjC2ClassRO:
     def dump_method(self, method):
         #meth_name, meth_type, '0x{:x}'.format(imp_ptr)
         ident = '    '
-        print ident, ident, ident, '__objc2_meth<\'{:s}\', \'{:s}\', {:s}>'.format(method.name, method.type, method.imp)
+        print(ident, ident, ident, '__objc2_meth<\'{:s}\', \'{:s}\', {:s}>'.format(method.name, method.type, method.imp))
 
     def dump_ivar(self, ivar):
         #offset, meth_name, meth_type, alignment, size
         ident = '    '
-        print ident, ident, ident, '__objc2_ivar<0x{:X}, \'{:s}\', \'{:s}\', {:d}, {:d}>'.format(ivar.offset, ivar.name, ivar.type, ivar.alignment, ivar.size)
+        print(ident, ident, ident, '__objc2_ivar<0x{:X}, \'{:s}\', \'{:s}\', {:d}, {:d}>'.format(ivar.offset, ivar.name, ivar.type, ivar.alignment, ivar.size))
 
     def dump_property(self, property):
         #prop_name, prop_attr
         ident = '    '
-        print ident, ident, ident, '__objc2_prop<\'{:s}\', \'{:s}\'>'.format(property.name, property.attr)
+        print(ident, ident, ident, '__objc2_prop<\'{:s}\', \'{:s}\'>'.format(property.name, property.attr))
         
     def dump(self):
         ident = '    '
-        print ident, '{:s}:'.format(self.name)
+        print(ident, '{:s}:'.format(self.name))
 
-        print ident, ident, 'flags:0x{:X}, instance_start:0x{:X}, instance_size:0x{:X}, ivar_layout:0x{:X}, weak_ivar_layout:0x{:X}'.format(\
-            self.flags, self.inst_start, self.inst_size, self.ivar_layout, self.weak_ivar_layout)
+        print(ident, ident, 'flags:0x{:X}, instance_start:0x{:X}, instance_size:0x{:X}, ivar_layout:0x{:X}, weak_ivar_layout:0x{:X}'.format(\
+            self.flags, self.inst_start, self.inst_size, self.ivar_layout, self.weak_ivar_layout))
 
         if self.methods != None:
-            print ident, ident, 'method list:'
+            print(ident, ident, 'method list:')
             for method in self.methods:
                 self.dump_method(method)
         else:
-            print ident, ident, 'empty method list'
+            print(ident, ident, 'empty method list')
 
         if self.ivars != None:
-            print ident, ident, 'ivar list:'
+            print(ident, ident, 'ivar list:')
             for ivar in self.ivars:
                 self.dump_ivar(ivar)
         else:
-            print ident, ident, 'empty ivar list'
+            print(ident, ident, 'empty ivar list')
 
         if self.properties != None:
-            print ident, ident, 'property list:'
+            print(ident, ident, 'property list:')
             for property in self.properties:
                 self.dump_property(property)
         else:
-            print ident, ident, 'empty property list'
-
+            print(ident, ident, 'empty property list')
