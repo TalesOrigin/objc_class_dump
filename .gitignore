@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# scratch images written by the test suite
+tests/fixtures/tmp_*.bin
